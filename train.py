@@ -1,61 +1,86 @@
+import warnings
+warnings.filterwarnings("ignore", message="enable_nested_tensor is True")
+
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-import numpy as np
-import random
-from tokenizer import char2idx, idx2char, encoded_text
-from model import TinyRNN
+from torch.utils.data import TensorDataset, DataLoader
+from tqdm import tqdm
+from multiprocessing import freeze_support
+from model import TinyTransformer
+
+# ----------------------------
+# Inline tokenizer (whitespace‑level)
+# ----------------------------
+with open("data.txt", "r", encoding="utf-8", errors="ignore") as f:
+    tokens = f.read().split()
+
+vocab      = sorted(set(tokens))
+token2idx  = {t: i for i, t in enumerate(vocab)}
+vocab_size = len(vocab)
+encoded    = torch.tensor([token2idx[t] for t in tokens], dtype=torch.long)
+# ----------------------------
 
 # ========== CONFIGURATION ==========
-SEQ_LENGTH = 100
-BATCH_SIZE = 64
-EMBEDDING_DIM = 64
-HIDDEN_DIM = 128
-EPOCHS = 10
-LEARNING_RATE = 0.003
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+SEQ_LENGTH      = 16      # shorter context to reduce memory
+BATCH_SIZE      = 64      # smaller batch to stay within 1 GB RAM
+D_MODEL         = 32      # increased model dimensionality for better capacity
+NHEAD           = 1       # single attention head
+DIM_FEEDFORWARD = 64      # increased feedforward layer size for expressivity
+EPOCHS          = 5       # number of epochs
+LEARNING_RATE   = 0.003
+DEVICE          = torch.device("cpu")  # CPU-only
+# ====================================
 
-# ========== DATASET ==========
-class JokeDataset(Dataset):
-    def __init__(self, data, seq_length):
-        self.data = data
-        self.seq_length = seq_length
+# Precompute sliding windows: [num_sequences, SEQ_LENGTH+1]
+sequences = encoded.unfold(0, SEQ_LENGTH + 1, 1)
+# Split into inputs and targets
+x_data = sequences[:, :-1].contiguous()
+y_data = sequences[:, 1:].contiguous()
 
-    def __len__(self):
-        return len(self.data) - self.seq_length
+dataset = TensorDataset(x_data, y_data)  # pre-batched dataset
 
-    def __getitem__(self, idx):
-        x = torch.tensor(self.data[idx:idx+self.seq_length], dtype=torch.long)
-        y = torch.tensor(self.data[idx+1:idx+self.seq_length+1], dtype=torch.long)
-        return x, y
 
-# ========== DATA LOADER ==========
-dataset = JokeDataset(encoded_text, SEQ_LENGTH)
-dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+def train():
+    dataloader = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=False
+    )
 
-# ========== MODEL ==========
-model = TinyRNN(vocab_size=len(char2idx), embed_dim=EMBEDDING_DIM, hidden_dim=HIDDEN_DIM).to(DEVICE)
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    model = TinyTransformer(
+        vocab_size=vocab_size,
+        d_model=D_MODEL,
+        nhead=NHEAD,
+        num_layers=2,           # upgraded to 2 layers for more capacity
+        dim_feedforward=DIM_FEEDFORWARD
+    ).to(DEVICE)
 
-# ========== TRAIN LOOP ==========
-for epoch in range(EPOCHS):
-    model.train()
-    total_loss = 0
-    for x, y in dataloader:
-        x, y = x.to(DEVICE), y.to(DEVICE)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-        optimizer.zero_grad()
-        output, _ = model(x)
-        loss = criterion(output.view(-1, output.size(-1)), y.view(-1))
-        loss.backward()
-        optimizer.step()
+    for epoch in range(EPOCHS):
+        model.train()
+        total_loss = 0.0
+        print(f"\n--- Epoch {epoch+1}/{EPOCHS} ---")
+        for x, y in tqdm(dataloader, desc="Batches", unit="batch"):
+            x, y = x.to(DEVICE), y.to(DEVICE)
 
-        total_loss += loss.item()
+            optimizer.zero_grad()
+            logits, _ = model(x)
+            loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+            loss.backward()
+            optimizer.step()
 
-    avg_loss = total_loss / len(dataloader)
-    print(f"Epoch {epoch+1}/{EPOCHS}, Loss: {avg_loss:.4f}")
+            total_loss += loss.item()
 
-# ========== SAVE MODEL ==========
-torch.save(model.state_dict(), "tiny_rnn.pth")
-print("Model saved as tiny_rnn.pth")
+        avg_loss = total_loss / len(dataloader)
+        print(f"Epoch {epoch+1} average loss: {avg_loss:.4f}")
+
+    torch.save(model.state_dict(), "tiny_transformer.pth")
+    print("Model saved as tiny_transformer.pth")
+
+if __name__ == "__main__":
+    freeze_support()
+    train()
